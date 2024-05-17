@@ -4,15 +4,49 @@ const docusign = require('docusign-esign');
 import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
+import * as multer from 'multer';
+import * as https from 'https';
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
+const upload = multer({
+    dest: '/tmp/',
+    limits: { fileSize: 50 * 1024 * 1024 }, // Limit file size to 50MB
+}).single('file');
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-app.post('/create-envelope', async (req, res) => {
+function downloadFile(url: string, dest: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(dest);
+        https.get(url, (response) => {
+            response.pipe(file);
+            file.on('finish', () => {
+                
+            });
+        }).on('error', (err) => {
+            fs.unlink(dest, () => {}); // Delete the file async. (No need to check the result)
+            reject(err.message);
+        });
+    });
+}
+
+app.post('/create-envelope', upload, async (req, res) => {
     try {
+        console.log("File received:", req.file);
+
         const { CLIENT_ID, USER_ID, PRIVATE_KEY, REDIRECT_URI, API_BASE_PATH } = process.env;
+
+        if (!req.file) {
+            return res.status(400).send("No file uploaded");
+        }
+
+        const { email, name } = req.body;
+        if (!email || !name) {
+            return res.status(400).send("Email and name are required");
+        }
 
         // JWT Authentication
         const dsApiClient = new docusign.ApiClient();
@@ -37,17 +71,17 @@ app.post('/create-envelope', async (req, res) => {
 
         // Add a document
         const document = new docusign.Document();
-        const docBase64 = fs.readFileSync(path.resolve(__dirname, 'test.pdf')).toString('base64');
+        const docBase64 = fs.readFileSync(req.file.path).toString('base64');
         document.documentBase64 = docBase64;
-        document.name = 'Test Document';
-        document.fileExtension = 'pdf';
+        document.name = 'Uploaded Document';
+        document.fileExtension = path.extname(req.file.originalname).replace('.', ''); // e.g., pdf
         document.documentId = '1';
         envelope.documents = [document];
 
         // Add a recipient
         const signer = new docusign.Signer();
-        signer.email = req.body.email;
-        signer.name = req.body.name;
+        signer.email = email;
+        signer.name = name;
         signer.recipientId = '1';
         signer.clientUserId = '1000'; // Unique for each recipient
 
@@ -74,14 +108,20 @@ app.post('/create-envelope', async (req, res) => {
         const viewRequest = new docusign.RecipientViewRequest();
         viewRequest.returnUrl = REDIRECT_URI!;
         viewRequest.authenticationMethod = 'email';
-        viewRequest.email = req.body.email;
-        viewRequest.userName = req.body.name;
+        viewRequest.email = email;
+        viewRequest.userName = name;
         viewRequest.clientUserId = '1000';
 
         const recipientView = await envelopesApi.createRecipientView('account_id', envelopeId, { recipientViewRequest: viewRequest });
         res.json({ url: recipientView.url });
+
+        // Clean up the temporary file
+        fs.unlinkSync(req.file.path);
+        return res.json({ url: recipientView.url });
     } catch (error) {
-        res.status(500).send((error as any).message);
+        console.error("Error in create-envelope:", error);
+        return res.status(500).send((error as any).message);
+
     }
 });
 
